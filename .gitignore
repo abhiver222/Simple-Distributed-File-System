@@ -1,0 +1,5 @@
+/files
+*.swp
+logfile.log
+/test_files
+sendFiles.pyp

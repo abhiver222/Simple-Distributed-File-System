@@ -1,0 +1,342 @@
+package main
+
+import (
+	"bytes"
+	"encoding/gob"
+	"fmt"
+	"net"
+	"os"
+	"os/exec"
+	"time"
+)
+
+/*Struct containing file information: name, machines it's replicated on, and size*/
+type file_info struct {
+	Name string
+	IPs  []string
+	Size int64
+}
+
+/*dictionary with keys = filenames and values = array of ip's corresponding to machines
+the file is replicated on. Only maintined in introducer and following 2 machines in membershiplist*/
+var file_list = make(map[string]file_info)
+
+/*Stores sdfs names for all files stored locally*/
+var local_files = make([]string, 0)
+
+/*Adds file to sdfs given a local path and requested sdfs name. First checks if file already exists locally
+in sdfs file directoy. If it does, it returns. Copies file from local path to sdfs file directory and sends
+a add file message to introducer to request to add file if the machine is not the introducer. If the machine
+is the introducer, it scp's the file to the next 3 machines to replicate the file and updates the file list*/
+func store_file(local_path string, sdfs_name string) {
+	if check_if_exists(sdfs_name) == 1 {
+		return
+	}
+	_, err := exec.Command("cp", local_path, "/home/ddle2/CS425-MP3/files/"+sdfs_name).Output()
+	errorCheck(err)
+	if err != nil {
+		fmt.Println("Local file does not exist")
+		return
+	}
+	if getIP() != INTRODUCER {
+		sendAddFile(sdfs_name, getFileSize(local_path))
+	} else {
+		//TODO What if file exists?
+		ip_dest1 := membershipList[(getIndex(currHost)+1)%len(membershipList)].Host
+		ip_dest2 := membershipList[(getIndex(currHost)+2)%len(membershipList)].Host
+		ip_dest3 := membershipList[(getIndex(currHost)+3)%len(membershipList)].Host
+		go sendFile(currHost, ip_dest1, sdfs_name)
+		go sendFile(currHost, ip_dest2, sdfs_name)
+		go sendFile(currHost, ip_dest3, sdfs_name)
+
+		file_ips := make([]string, 0)
+		file_ips = append(file_ips, currHost)
+		file_ips = append(file_ips, ip_dest1)
+		file_ips = append(file_ips, ip_dest2)
+		file_ips = append(file_ips, ip_dest3)
+		file_list[sdfs_name] = file_info{sdfs_name, file_ips, getFileSize(local_path)}
+		sendFileMD()
+
+		message := message{currHost, "FileSent", time.Now().Format(time.RFC850), file_list[sdfs_name]}
+		var targetHosts = make([]string, 3)
+		targetHosts[0] = ip_dest1
+		targetHosts[1] = ip_dest2
+		targetHosts[2] = ip_dest3
+
+		sendMsg(message, targetHosts)
+	}
+	local_files = append(local_files, sdfs_name)
+	infoCheck("file " + sdfs_name + " added to "+ currHost)
+}
+
+/*Function to delete file from the sdfs. If the machine is the introducer, it deletes the file by calling
+sendDeleteFile function. Else, the machine sends a 'deletefile' request to the introducer*/
+func delete_file(sdfs_name string) {
+	if currHost != INTRODUCER {
+		msg := message{currHost, "DeleteFile", time.Now().Format(time.RFC850), file_info{sdfs_name, nil, 0}}
+		var targetHosts = make([]string, 1)
+		targetHosts[0] = INTRODUCER
+		sendMsg(msg, targetHosts)
+	} else {
+		if tgtFileInfo, exists := file_list[sdfs_name]; exists {
+			sendDeleteFile(tgtFileInfo)
+		} else {
+			fmt.Println("File does not exist")
+		}
+	}
+}
+
+/*Sends 'deletefile' message to all ips that have replicated the targetfile*/
+func sendDeleteFile(tgtFileInfo file_info) {
+	fmt.Println("Deleting file")
+	for _, machine := range membershipList {
+		if machine.Host != INTRODUCER {
+			msg := message{currHost, "DeleteFile", time.Now().Format(time.RFC850), tgtFileInfo}
+			var targetHosts = make([]string, 1)
+			targetHosts[0] = machine.Host
+			sendMsg(msg, targetHosts)
+		} else {
+			removeFile(tgtFileInfo.Name)
+		}
+	}
+}
+
+/*Function to print the ips of all machines a file is replicated given its sdfs name. If the machine
+is the introducer, it checks its file_list and prints the ips. Else, the machine sends a 'getfilelocations'
+message to the introducer*/
+func getFileLocations(sdfs_name string) {
+	if currHost != INTRODUCER {
+		msg := message{currHost, "getFileLocations", time.Now().Format(time.RFC850), file_info{sdfs_name, nil, 0}}
+		var targetHosts = make([]string, 1)
+		targetHosts[0] = INTRODUCER
+		sendMsg(msg, targetHosts)
+	} else {
+		for _, element := range file_list[sdfs_name].IPs {
+			fmt.Println(element)
+		}
+	}
+
+}
+
+/*Function to pull a file. If the machine is the introducer, it checks file_list to get an ip of a machine the file
+is replicated on, scps the file, and updates its local file list. Else, the machine sends a 'requestFile' message
+to the introducer*/
+func fetchFile(sdfs_name string) {
+	if check_if_exists(sdfs_name) == 1 {
+		fmt.Println("File already exists in local 'files' directory")
+		return
+	}
+	if currHost != INTRODUCER {
+		msg := message{currHost, "requestFile", time.Now().Format(time.RFC850), file_info{sdfs_name, nil, 0}}
+		var targetHosts = make([]string, 1)
+		targetHosts[0] = INTRODUCER
+		sendMsg(msg, targetHosts)
+	} else {
+		if tgtFileInfo, exists := file_list[sdfs_name]; exists {
+			//Does not take into account if the first ip in tgtFileInfo's IP's list fails during transfer
+			go sendFile(tgtFileInfo.IPs[0], currHost, sdfs_name)
+			local_files = append(local_files, sdfs_name)
+			infoCheck("file " + sdfs_name + " fetched")
+		} else {
+			fmt.Println("File does not exist")
+		}
+	}
+}
+
+/*helper function to check if file exists locally in the sdfs file directory*/
+func check_if_exists(sdfs_name string) int {
+	for _, element := range local_files {
+		if element == sdfs_name {
+			fmt.Println("File with name " + sdfs_name + " exists in sdfs")
+			return 1
+		}
+	}
+	return 0
+}
+
+/*Helper function for sending an 'addFile' message*/
+func sendAddFile(sdfs_name string, file_size int64) {
+	file_ips := make([]string, 0)
+	file_ips = append(file_ips, getIP())
+	curr_index := getIndex(currHost)
+	file_ips = append(file_ips, membershipList[(curr_index+1)%len(membershipList)].Host)
+	file_ips = append(file_ips, membershipList[(curr_index+2)%len(membershipList)].Host)
+	msg := message{currHost, "AddFile", time.Now().Format(time.RFC850), file_info{sdfs_name, file_ips, file_size}}
+	var targetHosts = make([]string, 1)
+	targetHosts[0] = INTRODUCER
+
+	sendMsg(msg, targetHosts)
+}
+
+/*Helper function for sending an 'fileExists' message*/
+func sendFileExists(msg message) {
+	msg = message{getIP(), "FileExists", time.Now().Format(time.RFC850), msg.File_Info}
+	var targetHosts = make([]string, 1)
+	targetHosts[0] = msg.Host
+
+	sendMsg(msg, targetHosts)
+}
+
+/*helper function to get file size*/
+func getFileSize(local_path string) int64 {
+	file, err := os.Open(local_path)
+	if err != nil {
+		errorCheck(err)
+		return -1
+	}
+	defer file.Close()
+	stat, err := file.Stat()
+	if err != nil {
+		errorCheck(err)
+		return -1
+	}
+	return stat.Size()
+}
+
+/*helper function to remove file from local sdfs file directory and update local_files list*/
+func removeFile(sdfs_name string) {
+	_, err := exec.Command("rm", "/home/ddle2/CS425-MP3/files/"+sdfs_name).Output()
+	errorCheck(err)
+
+	for index, element := range local_files {
+		if element == sdfs_name {
+			local_files = append(local_files[0:index], local_files[index+1:]...)
+			break
+		}
+	}
+	infoCheck("file " + sdfs_name + " removed from " + currHost)
+}
+
+/*Helper function to scp file given the source machine, destination machine, and sdfs name*/
+func sendFile(ip_src string, ip_dest string, sdfs_name string) {
+	IP_src, _, _ := net.ParseCIDR(ip_src)
+	IP_dest, _, _ := net.ParseCIDR(ip_dest)
+	infoCheck("scp" + " ddle2@" + IP_src.String() + ":/home/ddle2/CS425-MP3/files/" + sdfs_name + " ddle2@" + IP_dest.String() + ":/home/ddle2/CS425-MP3/files")
+	_, err := exec.Command("scp", "ddle2@"+IP_src.String()+":/home/ddle2/CS425-MP3/files/"+sdfs_name, "ddle2@"+IP_dest.String()+":/home/ddle2/CS425-MP3/files").Output()
+	errorCheck(err)
+}
+
+/*Helper function to replicate a file. Called when a machine fails and the files it contained need to be
+replicated on an additional machine*/
+func replicate(host string) {
+	for key, value := range file_list { //key = filename; value = filestruct
+		for index, ip := range value.IPs { //itererate over ips
+			if ip == host {
+				new_file_ips := append(value.IPs[0:index], value.IPs[index+1:]...)
+				info := file_info{key, new_file_ips, file_list[key].Size}
+				file_list[key] = info
+				//Only replicate file again if there are < min number of replicas
+				if len(value.IPs) <= 4 {
+					fmt.Println("Replicate called")
+					tgtIP := membershipList[(getIndex(value.IPs[len(value.IPs)-1])+1)%len(membershipList)].Host
+					for _, srcIP := range value.IPs {
+						if srcIP != host {
+							fmt.Println("value: " + value.IPs[len(value.IPs)-1])
+							message := message{currHost, "FileSent", time.Now().Format(time.RFC850), value}
+							var targetHosts = make([]string, 1)
+							targetHosts[0] = tgtIP
+							sendMsg(message, targetHosts)
+
+							sendFile(srcIP, tgtIP, key)
+						}
+					}
+					new_file_ips = append(file_list[key].IPs, tgtIP)
+					info = file_info{key, new_file_ips, file_list[key].Size}
+					file_list[key] = info
+				}
+			}
+
+		}
+	}
+	sendFileMD()
+
+}
+
+/*Check metadata with membershiplist to ensure correctness*/
+func crossCheckMD() {
+	//var goodIPs = make([]string, 0)
+	//var failedIPs = make([]string, 0)
+	for key, value := range file_list { //key = filename; value = filestruct
+		for index, ip := range value.IPs { //itererate over ips
+			exist := false
+			for _, m := range membershipList {
+				if m.Host == ip {
+					exist = true
+					break
+				}
+			}
+			if !exist {
+				new_file_ips := append(value.IPs[0:index], value.IPs[index+1:]...)
+				info := file_info{key, new_file_ips, file_list[key].Size}
+				file_list[key] = info
+				//Only replicate file again if there are < min number of replicas
+				if len(value.IPs) <= 4 {
+					tgtIP := membershipList[(getIndex(value.IPs[len(value.IPs)-1])+1)%len(membershipList)].Host
+					for _, srcIP := range value.IPs {
+						if srcIP != ip {
+							message := message{currHost, "FileSent", time.Now().Format(time.RFC850), value}
+							var targetHosts = make([]string, 1)
+							targetHosts[0] = tgtIP
+							sendMsg(message, targetHosts)
+
+							sendFile(srcIP, tgtIP, key)
+						}
+					}
+					new_file_ips = append(file_list[key].IPs, tgtIP)
+					info = file_info{key, new_file_ips, file_list[key].Size}
+					file_list[key] = info
+				}
+			}
+		}
+	}
+
+	sendFileMD()
+}
+
+/*Helper function replicate file_list from introducer to the next 2 machines in membershiplist*/
+func sendFileMD() {
+	var buf bytes.Buffer
+	if err := gob.NewEncoder(&buf).Encode(file_list); err != nil {
+		errorCheck(err)
+	}
+
+	localip, _, _ := net.ParseCIDR(currHost)
+	LocalAddr, err := net.ResolveUDPAddr("udp", localip.String()+":0")
+	errorCheck(err)
+
+	for i := 0; i < len(membershipList); i++ {
+		if membershipList[i].Host != INTRODUCER {
+			ip, _, _ := net.ParseCIDR(membershipList[i].Host)
+
+			ServerAddr, err := net.ResolveUDPAddr("udp", ip.String()+":10002")
+			errorCheck(err)
+
+			conn, err := net.DialUDP("udp", LocalAddr, ServerAddr)
+			errorCheck(err)
+
+			_, err = conn.Write(buf.Bytes())
+			errorCheck(err)
+		}
+	}
+}
+
+/*server to receive file_list udpates*/
+func metaDataServer() {
+	ServerAddr, err := net.ResolveUDPAddr("udp", ":10002")
+	errorCheck(err)
+
+	ServerConn, err := net.ListenUDP("udp", ServerAddr)
+	errorCheck(err)
+	defer ServerConn.Close()
+
+	buf := make([]byte, 1024)
+
+	for {
+		fl := make(map[string]file_info)
+		n, _, err := ServerConn.ReadFromUDP(buf)
+		err = gob.NewDecoder(bytes.NewReader(buf[:n])).Decode(&fl)
+		file_list = fl
+		infoCheck("metadata replicated at " + currHost)
+		errorCheck(err)
+	}
+}
